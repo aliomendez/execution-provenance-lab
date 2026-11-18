@@ -1,0 +1,42 @@
+name: Synthetic provenance smoke test
+on:
+  push:
+    paths:
+      - '.github/workflows/provenance.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Generate disposable receipt
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          assert hashlib.sha256(b'abc').hexdigest() == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+          receipt = {'scope':'synthetic-public-smoke-only','status':'PASS','source_commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'fixture_sha256':hashlib.sha256(b'abc').hexdigest()}
+          pathlib.Path('receipt.json').write_text(json.dumps(receipt,sort_keys=True)+'\n')
+          PY
+      - name: Sign provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: receipt.json
+      - name: Verify signed provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify receipt.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/provenance.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - name: Reject tampered receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp receipt.json tampered.json
+          printf 'tamper' >> tampered.json
+          if gh attestation verify tampered.json --repo "$GITHUB_REPOSITORY"; then exit 1; fi
+      - name: Print disposable receipt
+        run: base64 -w0 receipt.json && echo
