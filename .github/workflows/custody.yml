@@ -1,0 +1,85 @@
+name: Synthetic encrypted custody
+on:
+  push:
+    paths:
+      - '.github/workflows/custody.yml'
+  workflow_dispatch:
+    inputs:
+      ciphertext:
+        description: 'Base64 synthetic ciphertext from generation run'
+        required: true
+        type: string
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+jobs:
+  generate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Encrypt disposable fixture
+        env:
+          LAB_KEY: ${{ secrets.LAB_TEST_KEY }}
+        run: |
+          set -eu
+          test "${#LAB_KEY}" -eq 64
+          umask 077
+          printf '%s' '{"scope":"synthetic-custody-only","value":42}' > disposable.json
+          printf '%s' "$LAB_KEY" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --cipher-algo AES256 --symmetric --output custody.gpg disposable.json
+          rm disposable.json
+      - name: Attest ciphertext
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: custody.gpg
+      - name: Export ciphertext only
+        run: |
+          sha256sum custody.gpg
+          base64 -w0 custody.gpg && echo
+  recover:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reconstruct and verify frozen ciphertext
+        env:
+          CIPHERTEXT: ${{ inputs.ciphertext }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '%s' "$CIPHERTEXT" | base64 -d > custody.gpg
+          gh attestation verify custody.gpg --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/custody.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - name: Recover and reject altered ciphertext and wrong key
+        env:
+          LAB_KEY: ${{ secrets.LAB_TEST_KEY }}
+        run: |
+          set -eu
+          test "${#LAB_KEY}" -eq 64
+          umask 077
+          printf '%s' "$LAB_KEY" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt --output recovered.json custody.gpg
+          python3 - <<'PY'
+          import json,pathlib
+          assert json.loads(pathlib.Path('recovered.json').read_text()) == {'scope':'synthetic-custody-only','value':42}
+          data=bytearray(pathlib.Path('custody.gpg').read_bytes())
+          data[-10]^=1
+          pathlib.Path('altered.gpg').write_bytes(data)
+          PY
+          if printf '%s' "$LAB_KEY" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt --output rejected.json altered.gpg; then exit 1; fi
+          if printf '%s' 'intentionally-wrong-disposable-key' | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --decrypt --output rejected.json custody.gpg; then exit 1; fi
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          receipt={'scope':'synthetic-only','result':'PASS','cipher_sha256':hashlib.sha256(pathlib.Path('custody.gpg').read_bytes()).hexdigest(),'source_commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'checks':['recovery','tamper_rejected','wrong_key_rejected']}
+          pathlib.Path('recovery-receipt.json').write_text(json.dumps(receipt,sort_keys=True)+'\n')
+          PY
+      - name: Attest recovery receipt
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: recovery-receipt.json
+      - name: Verify and export public receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify recovery-receipt.json --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/custody.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          base64 -w0 recovery-receipt.json && echo
