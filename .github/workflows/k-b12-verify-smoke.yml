@@ -1,0 +1,52 @@
+name: DT B12 official verifier smoke
+on:
+  push:
+    branches: [b12-verifier-smoke]
+    paths: [.github/workflows/k-b12-verify-smoke.yml]
+permissions:
+  contents: read
+  attestations: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify existing public digest with Sigstore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: 4e92eb66e8925cb204386d448c6bff14a12ff63900809d22dc002deecb8af966
+          SIGNER_SHA: 1adbc29b7bf89d869475e0295105abb4f3da1a06
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/b12verify"
+          source "$RUNNER_TEMP/b12verify/bin/activate"
+          python -m pip install --disable-pip-version-check 'sigstore==4.5.1'
+          gh api "repos/aliomendez/execution-provenance-lab/attestations/sha256:$DIGEST" > attestations.json
+          jq -e '.attestations | length == 1' attestations.json
+          jq -e '.attestations[0].bundle' attestations.json > bundle.json
+          identity='https://github.com/aliomendez/execution-provenance-lab/.github/workflows/k-b12-anchor.yml@refs/heads/main'
+          common=(--bundle bundle.json --cert-identity "$identity" --repository 'aliomendez/execution-provenance-lab' --ref refs/heads/main --trigger workflow_dispatch)
+          python -m sigstore verify github "sha256:$DIGEST" "${common[@]}" --sha "$SIGNER_SHA"
+          echo 'PASS: official digest, signature, transparency and identity verification'
+          python - <<'PY'
+          import base64, json, os
+          from cryptography import x509
+          from cryptography.x509.oid import ObjectIdentifier
+          bundle=json.load(open('bundle.json'))
+          cert=x509.load_der_x509_certificate(base64.b64decode(bundle['verificationMaterial']['certificate']['rawBytes']))
+          expected=os.environ['SIGNER_SHA'].encode()
+          for suffix, value in [('10',expected),('13',expected),('11',b'github-hosted')]:
+              actual=cert.extensions.get_extension_for_oid(ObjectIdentifier('1.3.6.1.4.1.57264.1.'+suffix)).value.value
+              assert actual==bytes([12,len(value)])+value, suffix
+          print('PASS: pinned signer/source commit and GitHub-hosted runner')
+          PY
+          if python -m sigstore verify github "sha256:$(printf '%064d' 0)" "${common[@]}" --sha "$SIGNER_SHA"; then
+            echo 'ERROR: wrong digest accepted'; exit 1
+          fi
+          echo 'PASS: wrong digest rejected'
+          if python -m sigstore verify github "sha256:$DIGEST" "${common[@]}" --sha "$(printf '%040d' 0)"; then
+            echo 'ERROR: wrong commit accepted'; exit 1
+          fi
+          echo 'PASS: wrong commit rejected'
+          echo 'B12_OFFICIAL_SMOKE=PASS; SYNTHETIC ONLY; NO CUSTODY ACCEPTANCE'
